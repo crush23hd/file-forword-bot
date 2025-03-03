@@ -1,99 +1,127 @@
 import os
-import logging
-import re
 import sqlite3
+import logging
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
 
 # Load environment variables
 load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Admin user ID
 
-# Logging for debugging
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+# Database setup
+DB_FILE = "bot_data.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT UNIQUE,
+            file_name TEXT,
+            file_number INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# Initialize database
+init_db()
+
+# Logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# In-memory storage for processed files
-processed_files = {}  # {channel_id: set(file_numbers)}
-
-# SQLite Database (Optional)
-conn = sqlite3.connect("bot_data.db")
-c = conn.cursor()
-c.execute("CREATE TABLE IF NOT EXISTS files (file_number INTEGER, channel TEXT, UNIQUE(file_number, channel))")
-conn.commit()
-
+# Store user channel/group selections
+user_destinations = {}
 
 async def start(update: Update, context: CallbackContext):
-    """Handles the /start command"""
-    await update.message.reply_text("📂 Send me files with a caption in format: '0001 @channelname'")
+    """ Start command """
+    await update.message.reply_text("Hello! Send me a file, and I'll forward it to the specified channel/group.")
 
+async def set_destination(update: Update, context: CallbackContext):
+    """ Set the destination channel/group """
+    if not context.args:
+        await update.message.reply_text("Usage: /setchannel <channel_or_group_id>")
+        return
+    
+    chat_id = context.args[0]
+    user_id = update.message.from_user.id
+    user_destinations[user_id] = chat_id
+    await update.message.reply_text(f"Destination set to: {chat_id}")
 
-async def handle_file(update: Update, context: CallbackContext):
-    """Handles file reception and forwards it to the correct channel in sequence"""
-    if not update.message.document:
+async def receive_file(update: Update, context: CallbackContext):
+    """ Handles file uploads, checks order, and forwards to the selected channel/group """
+    user_id = update.message.from_user.id
+    destination = user_destinations.get(user_id)
+
+    if not destination:
+        await update.message.reply_text("Please set a destination first using /setchannel <channel_id>")
         return
 
-    caption = update.message.caption
-    if not caption:
-        await update.message.reply_text("⚠️ Please send a caption with the file number and channel name.")
+    file = update.message.document or update.message.video or update.message.audio
+    if not file:
+        await update.message.reply_text("Please send a valid file.")
         return
 
-    # Extract file number and channel ID
-    match = re.search(r"(\d{1,4})\s+(@?\w+)", caption)
-    if not match:
-        await update.message.reply_text("❌ Incorrect format! Use: '0001 @channelname'")
+    file_id = file.file_id
+    file_name = file.file_name if hasattr(file, 'file_name') else "Unknown"
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Check for duplicate file
+    cursor.execute("SELECT file_id FROM files WHERE file_id = ?", (file_id,))
+    if cursor.fetchone():
+        await update.message.reply_text("Duplicate file detected. Skipping upload.")
+        conn.close()
         return
 
-    file_number = int(match.group(1))
-    channel_id = match.group(2)
+    # Determine next file number
+    cursor.execute("SELECT COALESCE(MAX(file_number), 0) FROM files")
+    last_number = cursor.fetchone()[0]
+    next_number = last_number + 1
+    formatted_number = f"{next_number:04d}"  # Format as 0001, 0002, etc.
 
-    # Ensure the channel tracking exists
-    if channel_id not in processed_files:
-        processed_files[channel_id] = set()
+    # Save file info to DB
+    cursor.execute("INSERT INTO files (file_id, file_name, file_number) VALUES (?, ?, ?)", 
+                   (file_id, file_name, next_number))
+    conn.commit()
+    conn.close()
 
-    # Check for duplicates
-    if file_number in processed_files[channel_id]:
-        await update.message.reply_text(f"🚫 Duplicate detected! File {file_number} already sent to {channel_id}.")
-        return
+    # Forward file to the destination
+    await context.bot.send_document(chat_id=destination, document=file_id, caption=f"File {formatted_number}: {file_name}")
 
-    # Store file in database
-    try:
-        c.execute("INSERT INTO files (file_number, channel) VALUES (?, ?)", (file_number, channel_id))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        await update.message.reply_text(f"🚫 Duplicate detected! File {file_number} already in database for {channel_id}.")
-        return
+    await update.message.reply_text(f"File {formatted_number} forwarded successfully!")
 
-    # Identify missing files
-    expected_files = set(range(1, file_number))
-    sent_files = {row[0] for row in c.execute("SELECT file_number FROM files WHERE channel=?", (channel_id,))}
-    missing_files = sorted(expected_files - sent_files)
+async def check_missing(update: Update, context: CallbackContext):
+    """ Check for missing files in the sequence """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT file_number FROM files ORDER BY file_number")
+    numbers = [row[0] for row in cursor.fetchall()]
+    conn.close()
 
-    # Log missing files but still process
-    if missing_files:
-        await update.message.reply_text(f"⚠️ Warning: Missing files {missing_files}. Please upload them soon.")
-
-    # Forward file
-    file = update.message.document
-    await context.bot.send_document(chat_id=channel_id, document=file.file_id, caption=f"📂 File {file_number}")
-
-    # Mark file as processed
-    processed_files[channel_id].add(file_number)
-    await update.message.reply_text(f"✅ File {file_number} forwarded to {channel_id}!")
-
+    missing = [n for n in range(1, max(numbers, default=1) + 1) if n not in numbers]
+    
+    if missing:
+        await update.message.reply_text(f"Missing file numbers: {', '.join(map(str, missing))}")
+    else:
+        await update.message.reply_text("No missing files detected.")
 
 def main():
-    """Starts the bot"""
+    """ Main function to start the bot """
     app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL & filters.Caption, handle_file))
+    app.add_handler(CommandHandler("setchannel", set_destination))
+    app.add_handler(CommandHandler("checkmissing", check_missing))
+    app.add_handler(MessageHandler(filters.ALL, receive_file))
 
-    logger.info("🤖 Bot is running...")
+    logger.info("Bot is running...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
