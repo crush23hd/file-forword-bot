@@ -10,7 +10,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Set your bot token
-BOT_TOKEN = "YOUR_BOT_TOKEN"
+BOT_TOKEN = "1193578192:AAFiR7523UP7DgqV-jXtfk1_ZsqJxtUChhI"
 
 # Set the destination chat ID (group/channel where files will be sent)
 DESTINATION_CHAT_ID = "YOUR_DESTINATION_CHAT_ID"
